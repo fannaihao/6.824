@@ -20,11 +20,15 @@ package raft
 import "sync"
 import "sync/atomic"
 import "../labrpc"
+import "time"
 
 // import "bytes"
 // import "../labgob"
 
-
+const g_election_timeout = 500        //ms
+const g_election_range = 200          //ms
+const g_heartbeat_timeout = 200       //ms
+const g_heartbeat_check_interval = 50 //ms
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -56,13 +60,20 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	current_term    int
+	voted_for       int
+	during_election bool
+	is_leader       bool
+	leader_id       int
 
+	last_heartbeat_time time.Time
+
+	log []ApplyMsg
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
@@ -83,8 +94,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
-}
 
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.current_term)
+	e.Encode(rf.voted_for)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+}
 
 //
 // restore previously persisted state.
@@ -106,10 +124,23 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var _current_term int
+	var _voted_for int
+	var _log []ApplyMsg
+	if d.Decode(&_current_term) != nil ||
+		d.Decode(&_voted_for) != nil ||
+		d.Decode(&_log) != nil {
+		DPrintf("Read persistent state error.")
+		panic("Read persistent state error.")
+	} else {
+		rf.current_term = _current_term
+		rf.voted_for = _voted_for
+		rf.log = _log
+	}
 }
-
-
-
 
 //
 // example RequestVote RPC arguments structure.
@@ -117,6 +148,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -125,6 +160,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -132,6 +169,11 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	if args.Term < rf.current_term {
+		reply.VoteGranted = false
+		return
+	}
+
 }
 
 //
@@ -168,6 +210,37 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	pervLogTerm  int
+	Entries      []ApplyMsg
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.update_heartbeat()
+	if args.Term == rf.current_term {
+		return
+	}
+
+	if args.Term < rf.current_term {
+		DPrintf("Server: %d receive term %d from AppendEntries which is larger than server's current term: %d",
+			rf.me, args.Term, rf.current_term)
+	}
+
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -189,7 +262,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -234,10 +306,48 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.during_election = false
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go rf.heartbeat_timeout_check()
 
 	return rf
+}
+
+func (rf *Raft) election_timeout_check() {
+	if !rf.killed() {
+	}
+	return
+}
+
+func (rf *Raft) start_election() {
+	rf.mu.Lock()
+
+	rf.current_term++
+
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) update_heartbeat() {
+	rf.mu.Lock()
+	rf.last_heartbeat_time = time.Now()
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) heartbeat_timeout_check() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		t := time.Now()
+		interval = t.Sub(rf.last_heartbeat_time).Milliseconds()
+		if g_heartbeat_timeout < interval && !rf.during_election {
+			DPrintf("Server: %d is heartbeat timeout, start election.", rf.me)
+			rf.during_election = true
+			// start election
+		}
+		rf.mu.Unlock()
+		time.Sleep(g_heartbeat_check_interval * time.Millisecond)
+	}
+	return
 }
